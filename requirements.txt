@@ -9,4 +9,3 @@ python-multipart
 psycopg[binary]
 python-dotenv
 yfinance
-hypercorn
