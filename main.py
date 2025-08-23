@@ -107,8 +107,11 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
-        "https://omega-division-gh7shz8hy-omegadivisions-projects.vercel.app", 
+        "https://omega-division.vercel.app",                         # <— your prod Vercel domain
+        "https://omega-division-gh7shz8hy-omegadivisions-projects.vercel.app",  # <— your preview
     ],
+    # allow all *.vercel.app previews:
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
