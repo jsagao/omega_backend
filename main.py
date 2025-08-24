@@ -32,7 +32,8 @@ class PostBase(SQLModel):
     # featured controls
     featured_slot: str = "none"         # "none" | "main" | "mini"
     featured_rank: Optional[int] = None # smaller number = higher priority
-    cover_image_url: str = ""           # image for posts
+    cover_image_url: str = ""   
+    author_image_url: str = ""   # 👈 NEW        # image for posts
 
 class Post(PostBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -51,6 +52,7 @@ class PostUpdate(SQLModel):
     featured_slot: Optional[str] = None
     featured_rank: Optional[int] = None
     cover_image_url: Optional[str] = None
+    author_image_url: Optional[str] = None
 
 # ---------- Models (existing Comment stuff) ----------
 class Comment(SQLModel, table=True):
