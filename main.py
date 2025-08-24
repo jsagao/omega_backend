@@ -71,19 +71,21 @@ class CommentCreate(SQLModel):
 # Read DATABASE_URL from environment, default to sqlite for dev
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./blog.db")
 
-# Normalize old-style URIs (e.g., "postgres://...") to the psycopg3 URL
+# Normalize to psycopg3 driver
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+elif DATABASE_URL.startswith("postgresql://") and "+psycopg://" not in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
-# Supabase/Postgres needs SSL; SQLite does not
+# SSL for Supabase/Postgres; SQLite doesn't need it
 connect_args = {}
-if DATABASE_URL.startswith("postgresql+psycopg://") or DATABASE_URL.startswith("postgresql://"):
+if DATABASE_URL.startswith("postgresql+psycopg://"):
     connect_args = {"sslmode": "require"}
 
 engine = create_engine(
     DATABASE_URL,
     connect_args=connect_args,
-    pool_pre_ping=True,   # helps avoid stale connections
+    pool_pre_ping=True,
     echo=False,
 )
 
