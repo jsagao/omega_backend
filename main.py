@@ -1,46 +1,87 @@
 # main.py
 import os
+import re
+import html
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 from datetime import datetime
-import re, html
-from dotenv import load_dotenv
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from sqlmodel import SQLModel, Field, Session, create_engine, select
-from sqlalchemy import or_, func
-from rss_finance_home import router as rss_router
-import yfinance as yf
 
-load_dotenv() 
-# ---------- Helpers ----------
+from sqlmodel import SQLModel, Field, Session, create_engine, select
+from sqlalchemy import or_, func, Column
+from sqlalchemy.types import JSON  # Postgres=JSONB, SQLite=TEXT fallback
+
+import yfinance as yf
+from rss_finance_home import router as rss_router
+
+load_dotenv()
+
+
+# ---------- helpers ----------
 def html_to_text(s: str) -> str:
     """Very simple HTML → text (good enough for building an excerpt)."""
     text = re.sub(r"<[^>]*>", "", s or "")
     return html.unescape(text).strip()
 
 
-# ---------- Models ----------
+def normalize_video_urls(urls: Optional[List[str]]) -> List[str]:
+    """
+    Accepts a list-like of strings, trims, keeps only http(s) URLs.
+    (You can expand this to enforce specific hosts like youtube/vimeo, etc.)
+    """
+    if not urls:
+        return []
+    out: List[str] = []
+    for raw in urls:
+        if not isinstance(raw, str):
+            continue
+        u = raw.strip()
+        if not u:
+            continue
+        if u.startswith("http://") or u.startswith("https://"):
+            out.append(u)
+    # de-dup while preserving order
+    seen = set()
+    deduped = []
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            deduped.append(u)
+    return deduped
+
+
+# ---------- models ----------
 class PostBase(SQLModel):
     title: str
     category: str = "general"
     author: str = "anonymous"
-    excerpt: str = ""      # short, plain text preview
-    content: str = ""      # full HTML (from ReactQuill)
-    description: str = ""  # deprecated (kept for back-compat)
+    excerpt: str = ""       # short, plain text preview
+    content: str = ""       # full HTML (from ReactQuill)
+    description: str = ""   # deprecated (kept for back-compat)
     # featured controls
-    featured_slot: str = "none"         # "none" | "main" | "mini"
-    featured_rank: Optional[int] = None # smaller number = higher priority
-    cover_image_url: str = ""   
-    author_image_url: str = ""   # 👈 NEW        # image for posts
+    featured_slot: str = "none"          # "none" | "main" | "mini" | "portfolio"
+    featured_rank: Optional[int] = None  # smaller number = higher priority
+    cover_image_url: str = ""
+    author_image_url: str = ""           # author's avatar URL (from Clerk or custom)
+
+    # NEW: list of video URLs to embed on the post detail page
+    video_urls: List[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False, server_default="[]"),
+    )
+
 
 class Post(PostBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
+
 class PostCreate(PostBase):
     pass
+
 
 class PostUpdate(SQLModel):
     title: Optional[str] = None
@@ -53,8 +94,10 @@ class PostUpdate(SQLModel):
     featured_rank: Optional[int] = None
     cover_image_url: Optional[str] = None
     author_image_url: Optional[str] = None
+    video_urls: Optional[List[str]] = None  # NEW
 
-# ---------- Models (existing Comment stuff) ----------
+
+# ---------- comment models ----------
 class Comment(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     post_id: int = Field(index=True)
@@ -62,13 +105,14 @@ class Comment(SQLModel, table=True):
     body: str = ""
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
+
 class CommentCreate(SQLModel):
     post_id: int
     author: str
     body: str
 
 
-# Read DATABASE_URL from environment, default to sqlite for dev
+# ---------- DB ----------
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./blog.db")
 
 # Normalize to psycopg3 driver
@@ -78,7 +122,7 @@ elif DATABASE_URL.startswith("postgresql://") and "+psycopg://" not in DATABASE_
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
 # SSL for Supabase/Postgres; SQLite doesn't need it
-connect_args = {}
+connect_args: Dict[str, Any] = {}
 if DATABASE_URL.startswith("postgresql+psycopg://"):
     connect_args = {"sslmode": "require"}
 
@@ -89,12 +133,10 @@ engine = create_engine(
     echo=False,
 )
 
+
 def init_db():
-    # create tables if they don't exist
     SQLModel.metadata.create_all(engine)
 
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -102,32 +144,31 @@ async def lifespan(app: FastAPI):
     yield
 
 
-# ---------- App ----------
+# ---------- app ----------
 app = FastAPI(title="Blog API", lifespan=lifespan)
 
-# CORS (Vite dev)
+# CORS (Vite dev + Vercel)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
-        "https://omega-division.vercel.app",                         # <— your prod Vercel domain
-        "https://omega-division-gh7shz8hy-omegadivisions-projects.vercel.app",  # <— your preview
+        "https://omega-division.vercel.app",
+        "https://omega-division-gh7shz8hy-omegadivisions-projects.vercel.app",
     ],
-    # allow all *.vercel.app previews:
     allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Include the RSS router (your existing module)
+# RSS router (your existing module)
 app.include_router(rss_router)
 
 
-# ---------- Routes ----------
+# ---------- routes ----------
 @app.get("/health")
-def health() -> dict[str, bool]:
+def health() -> Dict[str, bool]:
     return {"ok": True}
 
 
@@ -185,6 +226,9 @@ def create_post(payload: PostCreate) -> Post:
     with Session(engine) as session:
         data = payload.dict()
 
+        # normalize videos
+        data["video_urls"] = normalize_video_urls(data.get("video_urls"))
+
         # auto-fill excerpt if missing but content present
         if not data.get("excerpt") and data.get("content"):
             data["excerpt"] = html_to_text(data["content"])[:220]
@@ -200,12 +244,12 @@ def create_post(payload: PostCreate) -> Post:
         return post
 
 
-# ---------- Robust Quotes (fixes yfinance KeyError) ----------
+# ---------- quotes (robust) ----------
 def safe_price(tkr: yf.Ticker):
     """Return (last, prev_close, exchange, currency) safely across stocks/indices/FX/futures."""
     last = prev = exch = curr = None
 
-    # 1) Try fast_info when available
+    # 1) fast_info
     fi = getattr(tkr, "fast_info", None)
     if fi:
         try:
@@ -229,7 +273,7 @@ def safe_price(tkr: yf.Ticker):
         except Exception:
             pass
 
-    # 2) Fallback to .info (can be slow / sometimes limited)
+    # 2) info
     if last is None or prev is None or curr is None or exch is None:
         try:
             inf = tkr.info or {}
@@ -244,7 +288,7 @@ def safe_price(tkr: yf.Ticker):
         except Exception:
             pass
 
-    # 3) Fallback to recent history (most reliable)
+    # 3) history
     if last is None or prev is None:
         try:
             hist = tkr.history(period="5d", interval="1d", auto_adjust=False, prepost=True)
@@ -267,35 +311,36 @@ def get_quotes(symbols: str = Query(..., description="Comma-separated symbols e.
     out: List[Dict[str, Any]] = []
     for s in syms:
         try:
-            # Use single Ticker to reduce edge cases compared to Tickers aggregator
             t = yf.Ticker(s)
             last, prev, exch, curr = safe_price(t)
-
             chg = pct = None
             if last is not None and prev is not None:
                 chg = last - prev
                 pct = (chg / prev * 100.0) if prev else None
 
-            out.append({
-                "symbol": s,
-                "price": last,
-                "prevClose": prev,
-                "change": chg,
-                "percent": pct,
-                "exchange": exch,
-                "currency": curr,
-            })
+            out.append(
+                {
+                    "symbol": s,
+                    "price": last,
+                    "prevClose": prev,
+                    "change": chg,
+                    "percent": pct,
+                    "exchange": exch,
+                    "currency": curr,
+                }
+            )
         except Exception:
-            # Return a safe row instead of throwing 500s
-            out.append({
-                "symbol": s,
-                "price": None,
-                "prevClose": None,
-                "change": None,
-                "percent": None,
-                "exchange": None,
-                "currency": None,
-            })
+            out.append(
+                {
+                    "symbol": s,
+                    "price": None,
+                    "prevClose": None,
+                    "change": None,
+                    "percent": None,
+                    "exchange": None,
+                    "currency": None,
+                }
+            )
     return {"quotes": out}
 
 
@@ -307,6 +352,10 @@ def update_post(post_id: int, payload: PostUpdate) -> Post:
             raise HTTPException(404, "Post not found")
 
         data = payload.dict(exclude_unset=True)
+
+        # normalize videos on update if provided
+        if "video_urls" in data:
+            data["video_urls"] = normalize_video_urls(data["video_urls"])
 
         # if content changed and excerpt not provided, regenerate excerpt
         if "content" in data and "excerpt" not in data:
@@ -401,7 +450,8 @@ def list_comments(post_id: int, limit: int = 50, offset: int = 0) -> List[Commen
             .limit(limit)
         )
         return session.exec(stmt).all()
-    
+
+
 @app.get("/portfolio", response_model=List[Post])
 def list_portfolio(limit: int = 20, offset: int = 0) -> List[Post]:
     limit = max(1, min(limit or 20, 50))
@@ -429,7 +479,6 @@ def create_comment(post_id: int, payload: CommentCreate) -> Comment:
     if not body:
         raise HTTPException(400, "Comment body is required")
     with Session(engine) as session:
-        # optional: ensure post exists
         if not session.get(Post, post_id):
             raise HTTPException(404, "Post not found")
 
