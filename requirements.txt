@@ -9,3 +9,4 @@ python-multipart
 psycopg[binary]
 python-dotenv
 yfinance
+cloudinary>=1.41.0

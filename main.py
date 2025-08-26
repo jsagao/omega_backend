@@ -2,24 +2,31 @@
 import os
 import re
 import html
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple, Iterable
 from contextlib import asynccontextmanager
 from datetime import datetime
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
+import cloudinary
+import cloudinary.uploader
 
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 from sqlalchemy import or_, func, Column
 from sqlalchemy.types import JSON  # Postgres=JSONB, SQLite=TEXT fallback
 
+import httpx
 import yfinance as yf
 from rss_finance_home import router as rss_router
 
 load_dotenv()
 
-
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+)
 # ---------- helpers ----------
 def html_to_text(s: str) -> str:
     """Very simple HTML → text (good enough for building an excerpt)."""
@@ -53,6 +60,120 @@ def normalize_video_urls(urls: Optional[List[str]]) -> List[str]:
     return deduped
 
 
+# ---------- Cloudinary config ----------
+CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME", "").strip()
+CLOUD_API_KEY = os.getenv("CLOUDINARY_API_KEY", "").strip()
+CLOUD_API_SECRET = os.getenv("CLOUDINARY_API_SECRET", "").strip()
+ALLOW_ADMIN_DELETE = os.getenv("CLOUDINARY_ADMIN_DELETE", "true").lower() not in {"0", "false", "no", ""}
+
+def cloudinary_enabled_admin() -> bool:
+    return bool(CLOUD_NAME and CLOUD_API_KEY and CLOUD_API_SECRET and ALLOW_ADMIN_DELETE)
+
+def _is_cloudinary_url(url: str) -> bool:
+    return bool(url and "res.cloudinary.com" in url)
+
+# Extract all Cloudinary URLs from a blob of HTML
+_IMG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
+
+def extract_cloudinary_urls_from_html(html_str: str) -> List[str]:
+    if not html_str:
+        return []
+    urls = []
+    for m in _IMG_SRC_RE.finditer(html_str):
+        src = (m.group(1) or "").strip()
+        if _is_cloudinary_url(src):
+            urls.append(src)
+    return urls
+
+# From a Cloudinary delivery URL (with or w/o transformations), derive the public_id and resource_type
+# Works for e.g.
+#   https://res.cloudinary.com/<cloud>/image/upload/c_limit,w_900,q_80/v1712345/folder/name.png
+#   https://res.cloudinary.com/<cloud>/image/upload/v1712345/name.jpg
+_CLOUD_PUBLIC_RE = re.compile(
+    r"""
+    https?://res\.cloudinary\.com/
+    (?P<cloud>[^/]+)/                  # cloud name
+    (?P<rtype>image|video|raw)/        # resource type
+    upload/                            # delivery type
+    (?:
+        [^/]+/                         # optional transformations chunk like c_limit,w_900,q_80
+    )*
+    (?:
+        v\d+/                          # optional version folder
+    )?
+    (?P<public_id>[^?#]+?)             # the path without query; may include folders and extension
+    (?:\.[A-Za-z0-9]+)?                # optional extension at the END – we'll strip it anyway
+    (?:\?.*)?$                         # optional query
+    """,
+    re.VERBOSE | re.IGNORECASE,
+)
+
+def cloudinary_public_id(url: str) -> Optional[Tuple[str, str]]:
+    """
+    Given a Cloudinary URL, returns (resource_type, public_id_without_extension) or None.
+    """
+    if not _is_cloudinary_url(url):
+        return None
+    m = _CLOUD_PUBLIC_RE.match(url)
+    if not m:
+        return None
+    rtype = m.group("rtype") or "image"
+    public_path = m.group("public_id") or ""
+    # Strip extension if present in the last segment
+    public_path = re.sub(r"\.[A-Za-z0-9]+$", "", public_path)
+    return rtype, public_path
+
+
+async def cloudinary_delete_by_token(delete_token: str) -> bool:
+    """
+    Client-side deletes (valid ~10 minutes after upload) using delete_token.
+    Works even for unsigned uploads if the upload preset has return_delete_token enabled.
+    """
+    if not (CLOUD_NAME and delete_token):
+        return False
+    url = f"https://api.cloudinary.com/v1_1/{CLOUD_NAME}/delete_by_token"
+    data = {"token": delete_token}
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, data=data)
+        # 200/2xx means Cloudinary accepted it; they return JSON with result
+        return r.status_code // 100 == 2
+
+
+async def cloudinary_admin_destroy_many(public_ids: Iterable[Tuple[str, str]]) -> Dict[str, Any]:
+    """
+    Admin API delete. Accepts an iterable of (resource_type, public_id).
+    Batches by resource_type for fewer HTTP calls.
+    """
+    results: Dict[str, Any] = {}
+    if not cloudinary_enabled_admin():
+        return {"ok": False, "reason": "admin_not_configured"}
+
+    # Group by resource type (image / video / raw)
+    buckets: Dict[str, List[str]] = {}
+    for rtype, pid in public_ids:
+        if not pid:
+            continue
+        buckets.setdefault(rtype, []).append(pid)
+
+    auth = (CLOUD_API_KEY, CLOUD_API_SECRET)
+
+    async with httpx.AsyncClient(timeout=20, auth=auth) as client:
+        for rtype, pids in buckets.items():
+            # Cloudinary Admin API: DELETE /resources/{resource_type}/upload?public_ids[]=... (array)
+            url = f"https://api.cloudinary.com/v1_1/{CLOUD_NAME}/resources/{rtype}/upload"
+            params = []
+            for pid in pids:
+                params.append(("public_ids[]", pid))
+
+            resp = await client.delete(url, params=params)
+            results[rtype] = {
+                "status": resp.status_code,
+                "ok": resp.status_code // 100 == 2,
+                "body": resp.json() if resp.headers.get("content-type","").startswith("application/json") else await resp.aread(),
+            }
+    return {"ok": True, "results": results}
+
+
 # ---------- models ----------
 class PostBase(SQLModel):
     title: str
@@ -65,6 +186,11 @@ class PostBase(SQLModel):
     featured_slot: str = "none"          # "none" | "main" | "mini" | "portfolio"
     featured_rank: Optional[int] = None  # smaller number = higher priority
     cover_image_url: str = ""
+    cover_image_public_id: Optional[str] = None
+    content_image_public_ids: List[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False, server_default="[]"),
+    )
     author_image_url: str = ""           # author's avatar URL (from Clerk or custom)
 
     # NEW: list of video URLs to embed on the post detail page
@@ -166,7 +292,7 @@ app.add_middleware(
 app.include_router(rss_router)
 
 
-# ---------- routes ----------
+# ---------- core routes ----------
 @app.get("/health")
 def health() -> Dict[str, bool]:
     return {"ok": True}
@@ -375,17 +501,82 @@ def update_post(post_id: int, payload: PostUpdate) -> Post:
 
 
 @app.delete("/posts/{post_id}", status_code=204)
-def delete_post(post_id: int) -> None:
+async def delete_post(post_id: int) -> None:
     """
     Idempotent delete:
-    - If the post exists -> delete it, return 204
+    - If the post exists -> delete it (and attempt Cloudinary cleanup), return 204
     - If it doesn't exist -> still return 204 (no error)
     """
+    # Grab URLs before deleting from DB (so we can clean Cloudinary afterwards)
+    cover_url = ""
+    body_html = ""
+
     with Session(engine) as session:
         post = session.get(Post, post_id)
         if post:
+            cover_url = post.cover_image_url or ""
+            body_html = post.content or ""
             session.delete(post)
             session.commit()
+
+    # Best-effort Cloudinary cleanup (do not block response)
+    try:
+        if cloudinary_enabled_admin():
+            urls = []
+            if _is_cloudinary_url(cover_url):
+                urls.append(cover_url)
+            urls.extend(extract_cloudinary_urls_from_html(body_html))
+
+            pub_ids = []
+            for u in urls:
+                pid = cloudinary_public_id(u)  # -> (resource_type, public_id) or None
+                if pid:
+                    pub_ids.append(pid)
+
+            if pub_ids:
+                await cloudinary_admin_destroy_many(pub_ids)
+    except Exception:
+        # Swallow errors so delete stays idempotent & fast
+        pass
+    # 204: no body
+
+    """
+    Idempotent delete:
+    - If the post exists -> delete it (and attempt Cloudinary cleanup), return 204
+    - If it doesn't exist -> still return 204 (no error)
+    """
+    # Collect URLs before DB delete (so we can clean Cloudinary)
+    cover_url = ""
+    body_html = ""
+
+    with Session(engine) as session:
+        post = session.get(Post, post_id)
+        if post:
+            cover_url = post.cover_image_url or ""
+            body_html = post.content or ""
+
+            session.delete(post)
+            session.commit()
+
+    # try Cloudinary cleanup (best-effort)
+    if cloudinary_enabled_admin():
+        urls: List[str] = []
+        if _is_cloudinary_url(cover_url):
+            urls.append(cover_url)
+        urls.extend(extract_cloudinary_urls_from_html(body_html))
+
+        pub_ids: List[Tuple[str, str]] = []
+        for u in urls:
+            tup = cloudinary_public_id(u)
+            if tup:
+                pub_ids.append(tup)
+
+        if pub_ids:
+            try:
+                await cloudinary_admin_destroy_many(pub_ids)
+            except Exception:
+                # don't block the API on cloudinary hiccups
+                pass
     # No response body for 204
 
 
@@ -487,3 +678,37 @@ def create_comment(post_id: int, payload: CommentCreate) -> Comment:
         session.commit()
         session.refresh(c)
         return c
+
+
+# ---------- Cloudinary utility endpoints ----------
+@app.post("/cloudinary/delete-by-token")
+async def api_delete_by_token(payload: Dict[str, str] = Body(...)) -> Dict[str, Any]:
+    """
+    Deletes a just-uploaded asset using a delete_token (valid ~10 minutes).
+    Body: { "delete_token": "..." }
+    Returns: { ok: true } if Cloudinary accepted.
+    """
+    token = (payload.get("delete_token") or "").strip()
+    if not token:
+        raise HTTPException(400, "delete_token is required")
+    ok = await cloudinary_delete_by_token(token)
+    if not ok:
+        raise HTTPException(400, "Cloudinary did not accept delete token (expired or invalid)")
+    return {"ok": True}
+
+
+@app.delete("/cloudinary/resource")
+async def api_delete_resource(url: str = Query(..., description="Full Cloudinary delivery URL")) -> Dict[str, Any]:
+    """
+    Admin delete by full Cloudinary URL (best for cover images if you want manual cleanup).
+    Requires API key/secret in env.
+    """
+    if not cloudinary_enabled_admin():
+        raise HTTPException(400, "Cloudinary admin credentials not configured on server")
+    if not _is_cloudinary_url(url):
+        raise HTTPException(400, "Not a Cloudinary URL")
+    tup = cloudinary_public_id(url)
+    if not tup:
+        raise HTTPException(400, "Could not parse public_id from URL")
+    res = await cloudinary_admin_destroy_many([tup])
+    return res
