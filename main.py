@@ -199,6 +199,10 @@ class PostBase(SQLModel):
         sa_column=Column(JSON, nullable=False, server_default="[]"),
     )
 
+    # NEW series fields
+    series_key: Optional[str] = None   # same for all posts in the series
+    series_part: Optional[int] = None  # 1,2,3,...
+
 
 class Post(PostBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -221,6 +225,9 @@ class PostUpdate(SQLModel):
     cover_image_url: Optional[str] = None
     author_image_url: Optional[str] = None
     video_urls: Optional[List[str]] = None  # NEW
+      # NEW
+    series_key: Optional[str] = None
+    series_part: Optional[int] = None
 
 
 # ---------- comment models ----------
@@ -345,6 +352,33 @@ def get_post(post_id: int) -> Post:
         if not post:
             raise HTTPException(404, "Post not found")
         return post
+
+@app.get("/posts/{post_id}/series")
+def get_series(post_id: int):
+    with Session(engine) as s:
+        post = s.get(Post, post_id)
+        if not post or not post.series_key:
+            return {"all": [], "prev": None, "next": None}
+
+        rows = s.exec(
+            select(Post)
+            .where(Post.series_key == post.series_key)
+            .order_by(Post.series_part.asc(), Post.created_at.asc())
+        ).all()
+
+        prev = nextp = None
+        if post.series_part is not None:
+            less = [r for r in rows if (r.series_part or 0) < post.series_part]
+            more = [r for r in rows if (r.series_part or 0) > post.series_part]
+            prev = less[-1] if less else None
+            nextp = more[0] if more else None
+
+        return {
+            "series_key": post.series_key,
+            "all": [{"id": r.id, "title": r.title, "part": r.series_part} for r in rows],
+            "prev": prev and {"id": prev.id, "title": prev.title, "part": prev.series_part},
+            "next": nextp and {"id": nextp.id, "title": nextp.title, "part": nextp.series_part},
+        }
 
 
 @app.post("/posts", response_model=Post, status_code=201)
