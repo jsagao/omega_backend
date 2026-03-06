@@ -504,6 +504,34 @@ def get_quotes(symbols: str = Query(..., description="Comma-separated symbols e.
     return {"quotes": out}
 
 
+@app.get("/api/chart")
+def get_chart(
+    symbol: str = Query(..., description="Ticker symbol e.g. ^GSPC"),
+    period: str = Query("6mo", description="Period: 1mo, 3mo, 6mo, 1y, 2y, 5y"),
+    interval: str = Query("1d", description="Interval: 1d, 1wk, 1mo"),
+):
+    """Return OHLCV time series for lightweight-charts."""
+    try:
+        t = yf.Ticker(symbol)
+        hist = t.history(period=period, interval=interval, auto_adjust=False)
+        if hist.empty:
+            return {"bars": []}
+        bars = []
+        for idx, row in hist.iterrows():
+            ts = int(idx.timestamp())
+            bars.append({
+                "time": ts,
+                "open": round(float(row["Open"]), 4),
+                "high": round(float(row["High"]), 4),
+                "low": round(float(row["Low"]), 4),
+                "close": round(float(row["Close"]), 4),
+                "volume": int(row.get("Volume", 0)),
+            })
+        return {"symbol": symbol, "bars": bars}
+    except Exception as exc:
+        return {"symbol": symbol, "bars": [], "error": str(exc)}
+
+
 @app.patch("/posts/{post_id}", response_model=Post)
 def update_post(post_id: int, payload: PostUpdate) -> Post:
     with Session(engine) as session:
